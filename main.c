@@ -26,13 +26,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <signal.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <unistd.h>
 #include <curses.h>
+#include <errno.h>
 #include <menu.h>
 #include <panel.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
+#include <sys/event.h>
 
 
 /* Output routines */
@@ -91,13 +97,13 @@ typedef struct _data_t
     FILE *fp;
     const char *full_path;
     const char *base_name;
-    char line[128];
+    char *line; /* pointer to the last line in buff */
+    char *buff; /* file content */
     struct _data_t *next;
     state_e state;
     ITEM *item;  /* Curses menu item for this file */
     time_t last_mod;
 } data_t;
-
 
 /* Screen (ncurses state and content) */
 typedef struct _screen_t
@@ -113,6 +119,15 @@ typedef struct _screen_t
     data_t *datas;
 } screen_t;
 
+/* Param to a thread */
+typedef struct _thread_param_t
+{
+    int opened_files;
+    data_t *data;
+    screen_t *master_screen;
+} thread_param_t;
+
+static void get_last_line(data_t *d);
 
 static void usage(const char *execname, const char *msg)
 {
@@ -123,41 +138,6 @@ static void usage(const char *execname, const char *msg)
        "    -d secs: Auto-update display every 'secs' seconds\n", execname);
     exit(0);
 }
-
-
-/* Update display */
-static void screen_create_menu(screen_t *screen)
-{
-    int i = 0;
-    data_t *d;
-    char line[COLS];
-    const char *def = "Updating...";
-
-    /* Count number of data items */
-    for (d=screen->datas; d; d=d->next)
-      ++i;
-    
-    /* Allocate a long line for the description (make it all spaces) */ 
-    memset(line, ' ', sizeof(line) - 1);
-    line[sizeof(line)] = '\0';
-    memcpy(line, def, strlen(def));
-
-    /* Allocate and create menu items (one per data item */
-    screen->items = (ITEM **)calloc(i+1, sizeof(ITEM *));
-    for (i=0, d=screen->datas; d; d=d->next, ++i)
-    {
-        screen->items[i] = new_item(d->base_name, line);
-        screen->items[i]->description.length = sizeof(line);
-        set_item_userptr(screen->items[i], (void *)d);
-        d->item = screen->items[i];
-    }
-
-    screen->menu = new_menu(screen->items);
-    set_menu_mark(screen->menu, "-->  ");
-    set_menu_win(screen->menu, screen->content);
-    post_menu(screen->menu);
-}
-
 
 /* Returns the starting x-coordinate such that when displaying a value of
  * 'length' characters long, it will be centered in the given window.
@@ -179,17 +159,248 @@ static void write_title_window(WINDOW *master)
     mvwprintw(master, 0, x, TITLE);
 }
 
+static void read_files(int bytes, int opened_files, data_t *data) {
+    char c;
+    int j;
+    char *last, *tmp;
+    data_t *d;
+
+
+    for (d = data; d; d = d->next)
+    {
+        if (d->state == UPDATED) {
+            if (d->buff == NULL) {
+                if ((d->buff = malloc(sizeof(char) * bytes)) == NULL) {
+                    ER("Can't allocate memory for file buffer");
+                }
+            }
+            else if (bytes * sizeof(char) != sizeof(d->buff)) {
+                if ((tmp = realloc(d->buff, sizeof(char) * bytes)) == NULL) {
+                    ER("Can't reallocate memory for file buffer");
+                }
+                d->buff = tmp;
+            }
+            memset(d->buff, '\0', sizeof(char) * bytes);
+            /* Set the file-read pointer */
+            if (fseek(d->fp, -bytes, SEEK_END) == -1)
+                fseek(d->fp, 0, SEEK_SET);
+
+            j=0;
+            last = d->buff;
+            while ((c = fgetc(d->fp)) != EOF)
+            {
+                d->buff[j] = c;
+                if (j > 0 && d->buff[j-1] == '\n') {
+                    last = d->buff + j;
+                }
+                j++;
+            }
+            d->buff[j] = '\0';
+            d->line = last;
+        }
+    }
+}
+
+/* returns the writable bytes of the s WINDOW */
+static int getMaxBytes(WINDOW *s, int *maxx, int *maxy) {
+    getmaxyx(s, *maxy, *maxx);
+
+    *maxy -= 2; /* Ignore border */
+    *maxx -= 2; /* Ignore border */
+    return *maxx * *maxy;
+
+}
+
+static void *thread_read_files(void *args) {
+    char c;
+    int i, kq, opened_files, maxx, maxy;
+    struct kevent *ev;
+    screen_t *screen;
+    data_t *data, *d, *show_details = NULL;
+
+    data = ((thread_param_t *)args)->data;
+    opened_files = ((thread_param_t *)args)->opened_files;
+    screen = ((thread_param_t *)args)->master_screen;
+
+    free(args);
+
+    kq = kqueue();
+    if (kq < 0) {
+        ER("Can't initialize kqueue");
+    }
+
+    ev = (struct kevent *) malloc(sizeof(struct kevent) * opened_files + 3); /* allocate three extra events to get the notifications from the event loop */
+    if (ev == NULL) {
+        ER("Can't allocate memory for kevents");
+    }
+
+    i = 0;
+    for (d=screen->datas; d; d=d->next)
+    {
+        EV_SET(&ev[i], d->fd, EVFILT_VNODE, EV_ADD | EV_ENABLE | EV_CLEAR, NOTE_DELETE | NOTE_RENAME, 0, 0); /* Detect removal and renamming of the file */
+        EV_SET(&ev[i], d->fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, 0); /* Detect new data */
+        i++;
+    }
+    EV_SET(&ev[i++], SIGWINCH, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, 0);
+    EV_SET(&ev[i++], SIGUSR1, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, 0);
+    EV_SET(&ev[i++], SIGUSR2, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, 0);
+
+    if (kevent(kq, ev, opened_files + 3, NULL, 0, NULL) < 0) {
+        ER("Can't set kevent");
+    }
+
+    for (;;) {
+        read_files (getMaxBytes(screen->details, &maxx, &maxy), opened_files, data);
+
+        if (show_details == NULL) {
+            /* MHHHHH without an instruction here I have wierd curses behaviour
+             * when hidding details panel :-/ */
+            usleep(1);
+            for (d=screen->datas; d; d=d->next)
+            {
+                if (d->state == UPDATED) {
+                    d->item->description.str = d->line;
+                }
+            }
+            /* Refresh menu, this has to be after writting the line and
+             * before pritting the '*' because unpost/post erase the line */
+            unpost_menu(screen->menu);
+            post_menu(screen->menu);
+            for (d=screen->datas; d; d=d->next)
+            {
+                if (d->state == UPDATED && d != ((data_t *)(item_userptr(current_item(screen->menu))))) {
+                    mvwprintw(screen->content, item_index(d->item), 3, UPDATED_CHAR);
+                }
+                else {
+                    d->state = UNCHANGED;
+                }
+            }
+            hide_panel(screen->details_panel);
+        }
+        else {
+            wmove(screen->details, 1, 1);
+            i = 0;
+            while ((c = show_details->buff[i++]) != '\0') {
+                if (getcurx(screen->details) == maxx)
+                {
+                    waddch(screen->details, ' ');
+                    waddch(screen->details, ' ');
+                    waddch(screen->details, ' ');
+                }
+                else if (getcurx(screen->details) == 0)
+                    waddch(screen->details, ' ');
+
+                waddch(screen->details, c);
+            }
+
+            /* Display file name and draw border */
+            box(screen->details, 0, 0);
+            mvwprintw(screen->details, 0, 1, "[%s]", show_details->base_name);
+            show_panel(screen->details_panel);
+        }
+
+        update_panels();
+        doupdate();
+
+        i = kevent(kq, NULL, 0, ev, 1, NULL);
+        if (i > 0) {
+            if (ev->filter == EVFILT_SIGNAL &&
+                ev->ident == SIGWINCH) {
+
+                /* This ensure that LINES and COLS are correctly updated */
+                doupdate();
+
+                mvwprintw(screen->master, 1, columns-1, " ");
+                columns = COLS;
+                if (wresize(screen->master, LINES, COLS) == ERR)
+                    WR("Error resizing master windows");
+                if (wresize(screen->content,
+                            INNER_WIN_LINES, INNER_WIN_COLS) == ERR)
+                    WR("Error resizing content windows");
+                if (wresize(screen->details,
+                            INNER_WIN_LINES, INNER_WIN_COLS) == ERR)
+                    WR("Error resizing details windows");
+
+                /* Redraw the title and clean up the border */
+                write_title_window(screen->master);
+                unpost_menu(screen->menu);
+                post_menu(screen->menu);
+                update_panels();
+                doupdate();
+            }
+            else if (ev->filter == EVFILT_SIGNAL &&
+                     ev->ident == SIGUSR1) {
+               /* handle displaying details here */
+                show_details = item_userptr(current_item(screen->menu));
+            }
+            else if (ev->filter == EVFILT_SIGNAL &&
+                     ev->ident == SIGUSR2) {
+               /* handle displaying details here */
+                show_details = NULL;
+            }
+            else if (ev->filter == EVFILT_READ) {
+                for (d=screen->datas; d; d=d->next) {
+                    if(d->fd == ev->ident) {
+                        d->state = UPDATED;
+                        break;
+                    }
+                }
+            }
+        }
+        if (i < 0) {
+            DBG("Error retrieving kevent, we might have been interrupted");
+        }
+    }
+
+    return (void *) NULL;
+}
+
+/* Update display */
+static void screen_create_menu(screen_t *screen)
+{
+    int i = 0;
+    data_t *d;
+    char line[COLS];
+    const char *def = "Updating...";
+
+    /* Count number of data items */
+    for (d=screen->datas; d; d=d->next)
+      ++i;
+
+    /* Allocate a long line for the description (make it all spaces) */
+    memset(line, ' ', sizeof(line) - 1);
+    line[sizeof(line)] = '\0';
+    memcpy(line, def, strlen(def));
+
+    /* Allocate and create menu items (one per data item */
+    screen->items = (ITEM **)calloc(i+1, sizeof(ITEM *));
+    for (i=0, d=screen->datas; d; d=d->next, ++i)
+    {
+        screen->items[i] = new_item(d->base_name, line);
+        screen->items[i]->description.length = sizeof(line);
+        set_item_userptr(screen->items[i], (void *)d);
+        d->item = screen->items[i];
+    }
+
+    screen->menu = new_menu(screen->items);
+    set_menu_mark(screen->menu, "-->  ");
+    set_menu_win(screen->menu, screen->content);
+    post_menu(screen->menu);
+}
+
+
 
 /* Initialize curses */
 static screen_t *screen_create(data_t *datas, int timeout_ms)
 {
     screen_t *screen;
+    struct winsize w;
 
     initscr();
     cbreak();
     noecho();
     curs_set(0); /* Turn cursor off */
-    timeout(timeout_ms);
+    timeout(-1);
     keypad(stdscr, TRUE);
 
     screen = calloc(1, sizeof(screen_t));
@@ -216,13 +427,37 @@ static screen_t *screen_create(data_t *datas, int timeout_ms)
 /* Cleanup from curses */
 static void screen_destroy(screen_t *screen)
 {
+    nocbreak();
+    echo();
     endwin();
     free(screen);
 }
 
+/* wrapper function for thread creation */
+static pthread_t *threads_init(data_t *data, int opened_files, screen_t *screen) {
+    thread_param_t *params;
+    pthread_t *thread;
+
+    thread = (pthread_t *) malloc(sizeof(pthread_t));
+    if (thread == NULL) {
+        ER("Can't allocate memory for reading threads");
+    }
+
+    params = (thread_param_t *) malloc(sizeof(thread_param_t));
+    if (params == NULL) {
+        ER("Can't allocate memory for thread params");
+    }
+    params->opened_files = opened_files;
+    params->data = data;
+    params->master_screen = screen;
+
+    pthread_create(thread, NULL, thread_read_files, (void *)params);
+
+    return (thread);
+}
 
 /* Create our file information */
-static data_t *data_init(const char *fname)
+static data_t *data_init(const char *fname, int *nb_of_opened_files)
 {
     FILE *fp, *entry_fp;
     data_t *head, *tmp;
@@ -273,14 +508,25 @@ static data_t *data_init(const char *fname)
         head->full_path = strdup(c);
         head->base_name = strdup(basename((char *)head->full_path));
         head->state = UPDATED; /* Force first update to process this */
+        head->buff = NULL;
         head->next = tmp;
         free(line);
         line = NULL;
+        (*nb_of_opened_files)++;
+
+        if (fcntl(head->fd, F_SETFL, fcntl(head->fd, F_GETFL) & ~O_NONBLOCK ) == -1)
+            ER("Can't set blocking to file %s", head->base_name);
+
     }
 
     return head;
 }
 
+static void threads_destroy(pthread_t *thread) {
+    pthread_cancel(*thread);
+    pthread_join(*thread, (void **) NULL);
+    free(thread);
+}
 
 /* Cleanup */
 static void data_destroy(data_t *datas)
@@ -291,11 +537,11 @@ static void data_destroy(data_t *datas)
     {
         curr = d;
         fclose(d->fp);
+        free(d->buff);
         d = curr->next;
         free(curr);
     }
 }
-
 
 /* Set the last line for this file */
 static void get_last_line(data_t *d)
@@ -324,7 +570,6 @@ static void get_last_line(data_t *d)
     if (idx >= 0)
       strncpy(d->line, line+idx, sizeof(d->line) - 1);
 }
-
 
 /* Update data */
 static void data_update(data_t *datas)
@@ -383,7 +628,7 @@ static void update_details(screen_t *screen, const data_t *selected)
 
         waddch(screen->details, c);
     }
-    
+
     /* Display file name and draw border */
     box(screen->details, 0, 0);
     mvwprintw(screen->details, 0, 1, "[%s]", selected->base_name);
@@ -434,32 +679,16 @@ static void process(screen_t *screen)
 {
     int c;
     const data_t *show_details;
+    data_t *d;
 
     /* Force initial drawing */
-    data_update(screen->datas);
-    screen_update(screen, NULL);
+    //data_update(screen->datas);
+    //screen_update(screen, NULL);
     show_details = NULL;
-
     while ((c = getch()) != 'Q' && c != 'q')
     {
         switch (c)
         {
-            case KEY_RESIZE:
-                mvwprintw(screen->master, 1, columns-1, " ");
-                columns = COLS;
-                if (wresize(screen->master, LINES, COLS) == ERR)
-                    WR("Error resizing master windows");
-                if (wresize(screen->content,
-                            INNER_WIN_LINES, INNER_WIN_COLS) == ERR)
-                    WR("Error resizing content windows");
-                if (wresize(screen->details,
-                            INNER_WIN_LINES, INNER_WIN_COLS) == ERR)
-                    WR("Error resizing details windows");
-
-                /* Redraw the title and clean up the border */
-                write_title_window(screen->master);
-                break;
-
             case KEY_UP:
             case 'k':
                 menu_driver(screen->menu, REQ_UP_ITEM);
@@ -473,7 +702,7 @@ static void process(screen_t *screen)
             case KEY_ENTER:
             case '\n':
             case 'l':
-                show_details = item_userptr(current_item(screen->menu));
+                kill(getpid(), SIGUSR1);
                 break;
 
             /*  If no key was registered, or on some wacky
@@ -484,21 +713,36 @@ static void process(screen_t *screen)
 
             /* Someother key was pressed, exit details window */
             default:
-                show_details = NULL;
+                kill(getpid(), SIGUSR2);
+        }
+        ((data_t *)(item_userptr(current_item(screen->menu))))->state = UNCHANGED;
+        /* Refresh menu, this has to be after writting the line and
+         * before pritting the '*' because unpost/post erase the line */
+        unpost_menu(screen->menu);
+        post_menu(screen->menu);
+        for (d=screen->datas; d; d=d->next)
+        {
+            if (d->state == UPDATED) {
+                mvwprintw(screen->content, item_index(d->item), 3, UPDATED_CHAR);
+            }
         }
 
-        data_update(screen->datas);
-        screen_update(screen, show_details);
+        update_panels();
+        doupdate();
+        //data_update(screen->datas);
+        //screen_update(screen, show_details);
     }
 }
 
 
 int main(int argc, char **argv)
 {
-    int i, timeout_secs;
+    int i, timeout_secs, opened_files = 0;
     screen_t *screen;
     data_t *datas;
+    pthread_t *thread;
     const char *fname;
+    struct sigaction action;
 
     /* Args */
     fname = 0;
@@ -529,8 +773,13 @@ int main(int argc, char **argv)
     DBG("Using config:  %s", fname);
     DBG("Using timeout: %d seconds", timeout_secs);
 
+    /* Disabling SIGUSR1 */
+    action.sa_handler = SIG_IGN;
+    sigaction(SIGUSR1, &action, NULL);
+    sigaction(SIGUSR2, &action, NULL);
+
     /* Load data */
-    datas = data_init(fname);
+    datas = data_init(fname, &opened_files);
 
     /* Initialize display */
     screen = screen_create(datas, timeout_secs * 1000);
@@ -538,10 +787,14 @@ int main(int argc, char **argv)
     /* Initialize columns variable */
     columns = COLS;
 
+    /* Create reading threads */
+    thread = threads_init(datas, opened_files, screen);
+
     /* Do the work */
     process(screen);
 
     /* Cleanup */
+    threads_destroy(thread);
     data_destroy(datas);
     screen_destroy(screen);
 

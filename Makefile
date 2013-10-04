@@ -1,7 +1,7 @@
 APP = treetop
 SRC = main.c
 CFLAGS = -g3 -Wall
-LIBS = -lcurses -lmenu -lpanel
+LIBS = -lcurses -lmenu -lpanel -lpthread
 
 $(APP): $(SRC)
 	$(CC) $(SRC) $(CFLAGS) $(LIBS) -o $(APP)
