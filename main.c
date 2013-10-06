@@ -394,7 +394,6 @@ static void screen_create_menu(screen_t *screen)
 static screen_t *screen_create(data_t *datas, int timeout_ms)
 {
     screen_t *screen;
-    struct winsize w;
 
     initscr();
     cbreak();
