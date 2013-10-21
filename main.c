@@ -217,8 +217,11 @@ static int getMaxBytes(WINDOW *s, int *maxx, int *maxy) {
 
 static void *thread_read_files(void *args) {
     char c;
-    int i, kq, opened_files, maxx, maxy;
+    int i, opened_files, maxx, maxy;
+#ifdef HAVE_KQUEUE
+		int kq;
     struct kevent *ev;
+#endif /* !HAVE_KQUEUE */
     screen_t *screen;
     struct stat stats;
     data_t *data, *d;//, *show_details = NULL;
