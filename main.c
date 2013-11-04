@@ -22,6 +22,7 @@
 
 
 #define _WITH_GETLINE
+#include "config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,7 +39,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#ifdef HAVE_SYS_EVENT_H
 #include <sys/event.h>
+#endif /* !HAVE_SYS_EVENT_H */
 
 
 /* Output routines */
@@ -134,6 +137,7 @@ typedef struct _thread_param_t
 } thread_param_t;
 
 static void get_last_line(data_t *d);
+const data_t *show_details;
 
 static void usage(const char *execname, const char *msg)
 {
@@ -252,10 +256,14 @@ static void menu_driver_update(screen_t *screen, data_t *d, int c)
 static void *thread_read_files(void *args)
 {
     char c;
-    int i, kq, opened_files, maxx, maxy;
+    int i, opened_files, maxx, maxy;
+#ifdef HAVE_KQUEUE
+		int kq;
     struct kevent *ev;
+#endif /* !HAVE_KQUEUE */
     screen_t *screen;
-    data_t *data, *d, *show_details = NULL;
+    struct stat stats;
+    data_t *data, *d;//, *show_details = NULL;
 
     data = ((thread_param_t *)args)->data;
     opened_files = ((thread_param_t *)args)->opened_files;
@@ -263,16 +271,21 @@ static void *thread_read_files(void *args)
 
     free(args);
 
+#ifdef HAVE_KQUEUE
     kq = kqueue();
     if (kq < 0) {
         ER("Can't initialize kqueue");
     }
+#endif /* !HAVE_KQUEUE */
 
+#ifdef HAVE_KQUEUE
     ev = (struct kevent *) malloc(sizeof(struct kevent) * opened_files + 3); /* allocate three extra events to get the notifications from the event loop */
     if (ev == NULL) {
         ER("Can't allocate memory for kevents");
     }
+#endif /* !HAVE_KQUEUE */
 
+#ifdef HAVE_KQUEUE
     i = 0;
     for (d=screen->datas; d; d=d->next)
     {
@@ -283,10 +296,13 @@ static void *thread_read_files(void *args)
     EV_SET(&ev[i++], SIGWINCH, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, 0);
     EV_SET(&ev[i++], SIGUSR1, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, 0);
     EV_SET(&ev[i++], SIGUSR2, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, 0);
+#endif /* !HAVE_KQUEUE */
 
+#ifdef HAVE_KQUEUE
     if (kevent(kq, ev, opened_files + 3, NULL, 0, NULL) < 0) {
         ER("Can't set kevent");
     }
+#endif /* !HAVE_KQUEUE */
 
     for (;;) {
         read_files (getMaxBytes(screen->details, &maxx, &maxy), opened_files, data);
@@ -336,6 +352,7 @@ static void *thread_read_files(void *args)
 
         update_panels_safe();
 
+#ifdef HAVE_KQUEUE
         i = kevent(kq, NULL, 0, ev, 1, NULL);
         if (i > 0) {
             if (ev->filter == EVFILT_SIGNAL &&
@@ -382,6 +399,22 @@ static void *thread_read_files(void *args)
         if (i < 0) {
             DBG("Error retrieving kevent, we might have been interrupted");
         }
+#else  /* !HAVE_KQUEUE */
+				/* If the files have been updated, grab the last line from the file */
+				for (d=data; d; d=d->next)
+				{
+					if (stat(d->full_path, &stats) == -1)
+						ER("Could not obtain file stats for: '%s'", d->base_name);
+
+					/* If the file has been modified since last check, update */
+					if (stats.st_mtime != d->last_mod)
+					{
+						d->last_mod = stats.st_mtime;
+						d->state = UPDATED;
+					}
+				}
+				usleep(25000);
+#endif /* !HAVE_KQUEUE */
     }
 
     return (void *) NULL;
@@ -719,7 +752,6 @@ static void screen_update(screen_t *screen, const data_t *show_details)
 static void process(screen_t *screen)
 {
     int c;
-    const data_t *show_details;
     data_t *d;
 
     /* Force initial drawing */
@@ -741,7 +773,13 @@ static void process(screen_t *screen)
             case KEY_ENTER:
             case '\n':
             case 'l':
+#ifdef HAVE_KQUEUE
+								/* We send a signal to ourself to wakeup the kevent routine */
                 kill(getpid(), SIGUSR1);
+#else /* !HAVE_KQUEUE */
+                show_details = item_userptr(current_item(screen->menu));
+#endif /* HAVE_KQUEUE */
+
                 break;
 
             /*  If no key was registered, or on some wacky
@@ -752,7 +790,11 @@ static void process(screen_t *screen)
 
             /* Someother key was pressed, exit details window */
             default:
+#ifdef HAVE_KQUEUE
                 kill(getpid(), SIGUSR2);
+#else /* !HAVE_KQUEUE */
+                show_details = NULL;
+#endif
         }
     }
 }
