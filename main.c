@@ -90,6 +90,12 @@ typedef enum _state_e
 /* Stores the last X window columns number */
 static int columns = 0;
 
+/* Mutex to protect post_menu calls */
+static pthread_mutex_t mtx_post_menu;
+
+/* Mutex to protect doupdate calls */
+static pthread_mutex_t mtx_update_panels;
+
 /* File information */
 typedef struct _data_t
 {
@@ -211,7 +217,40 @@ static int getMaxBytes(WINDOW *s, int *maxx, int *maxy) {
 
 }
 
-static void *thread_read_files(void *args) {
+static void refresh_menus(screen_t *screen)
+{
+    pthread_mutex_lock(&mtx_post_menu);
+    unpost_menu(screen->menu);
+    post_menu(screen->menu);
+    pthread_mutex_unlock(&mtx_post_menu);
+}
+
+static void update_panels_safe()
+{
+    pthread_mutex_lock(&mtx_update_panels);
+    update_panels();
+    doupdate();
+    pthread_mutex_unlock(&mtx_update_panels);
+}
+
+static void menu_driver_update(screen_t *screen, data_t *d, int c)
+{
+    menu_driver(screen->menu, c);
+
+    ((data_t *)(item_userptr(current_item(screen->menu))))->state = UNCHANGED;
+    refresh_menus(screen);
+    for (d=screen->datas; d; d=d->next)
+    {
+        if (d->state == UPDATED) {
+            mvwprintw(screen->content, item_index(d->item), 3, UPDATED_CHAR);
+        }
+    }
+
+    update_panels_safe();
+}
+
+static void *thread_read_files(void *args)
+{
     char c;
     int i, kq, opened_files, maxx, maxy;
     struct kevent *ev;
@@ -253,9 +292,6 @@ static void *thread_read_files(void *args) {
         read_files (getMaxBytes(screen->details, &maxx, &maxy), opened_files, data);
 
         if (show_details == NULL) {
-            /* MHHHHH without an instruction here I have wierd curses behaviour
-             * when hidding details panel :-/ */
-            usleep(1);
             for (d=screen->datas; d; d=d->next)
             {
                 if (d->state == UPDATED) {
@@ -264,8 +300,7 @@ static void *thread_read_files(void *args) {
             }
             /* Refresh menu, this has to be after writting the line and
              * before pritting the '*' because unpost/post erase the line */
-            unpost_menu(screen->menu);
-            post_menu(screen->menu);
+            refresh_menus(screen);
             for (d=screen->datas; d; d=d->next)
             {
                 if (d->state == UPDATED && d != ((data_t *)(item_userptr(current_item(screen->menu))))) {
@@ -299,8 +334,7 @@ static void *thread_read_files(void *args) {
             show_panel(screen->details_panel);
         }
 
-        update_panels();
-        doupdate();
+        update_panels_safe();
 
         i = kevent(kq, NULL, 0, ev, 1, NULL);
         if (i > 0) {
@@ -323,10 +357,8 @@ static void *thread_read_files(void *args) {
 
                 /* Redraw the title and clean up the border */
                 write_title_window(screen->master);
-                unpost_menu(screen->menu);
-                post_menu(screen->menu);
-                update_panels();
-                doupdate();
+                refresh_menus(screen);
+                update_panels_safe();
             }
             else if (ev->filter == EVFILT_SIGNAL &&
                      ev->ident == SIGUSR1) {
@@ -436,6 +468,17 @@ static void screen_destroy(screen_t *screen)
 static pthread_t *threads_init(data_t *data, int opened_files, screen_t *screen) {
     thread_param_t *params;
     pthread_t *thread;
+
+    /* Init the mutex which protects "post_menu" calls */
+    if (pthread_mutex_init(&mtx_post_menu, NULL) < 0)
+    {
+      ER("Can't initiate post_menu mutex");
+    }
+
+    if (pthread_mutex_init(&mtx_update_panels, NULL) < 0)
+    {
+      ER("Can't initiate post_menu mutex");
+    }
 
     thread = (pthread_t *) malloc(sizeof(pthread_t));
     if (thread == NULL) {
@@ -669,8 +712,7 @@ static void screen_update(screen_t *screen, const data_t *show_details)
     else
       hide_panel(screen->details_panel);
 
-    update_panels();
-    doupdate();
+    update_panels_safe();
 }
 
 /* Capture user input (keys) and timeout to periodically referesh */
@@ -681,8 +723,6 @@ static void process(screen_t *screen)
     data_t *d;
 
     /* Force initial drawing */
-    //data_update(screen->datas);
-    //screen_update(screen, NULL);
     show_details = NULL;
     while ((c = getch()) != 'Q' && c != 'q')
     {
@@ -690,13 +730,13 @@ static void process(screen_t *screen)
         {
             case KEY_UP:
             case 'k':
-                menu_driver(screen->menu, REQ_UP_ITEM);
-                break;
+              menu_driver_update(screen, d, REQ_UP_ITEM);
+              break;
 
             case KEY_DOWN:
             case 'j':
-                menu_driver(screen->menu, REQ_DOWN_ITEM);
-                break;
+              menu_driver_update(screen, d, REQ_DOWN_ITEM);
+              break;
 
             case KEY_ENTER:
             case '\n':
@@ -714,22 +754,6 @@ static void process(screen_t *screen)
             default:
                 kill(getpid(), SIGUSR2);
         }
-        ((data_t *)(item_userptr(current_item(screen->menu))))->state = UNCHANGED;
-        /* Refresh menu, this has to be after writting the line and
-         * before pritting the '*' because unpost/post erase the line */
-        unpost_menu(screen->menu);
-        post_menu(screen->menu);
-        for (d=screen->datas; d; d=d->next)
-        {
-            if (d->state == UPDATED) {
-                mvwprintw(screen->content, item_index(d->item), 3, UPDATED_CHAR);
-            }
-        }
-
-        update_panels();
-        doupdate();
-        //data_update(screen->datas);
-        //screen_update(screen, show_details);
     }
 }
 
