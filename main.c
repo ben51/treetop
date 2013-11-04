@@ -236,20 +236,40 @@ static void update_panels_safe()
     pthread_mutex_unlock(&mtx_update_panels);
 }
 
-static void menu_driver_update(screen_t *screen, data_t *d, int c)
+static void menu_driver_update(screen_t *screen, int c)
 {
-    menu_driver(screen->menu, c);
+    data_t *d;
+    if (c >= 0)
+    {
+        menu_driver(screen->menu, c);
+    }
 
-    ((data_t *)(item_userptr(current_item(screen->menu))))->state = UNCHANGED;
+    for (d=screen->datas; d; d=d->next)
+    {
+        if (d->state == UPDATED)
+        {
+            d->item->description.str = d->line;
+        }
+    }
     refresh_menus(screen);
     for (d=screen->datas; d; d=d->next)
     {
-        if (d->state == UPDATED) {
-            mvwprintw(screen->content, item_index(d->item), 3, UPDATED_CHAR);
+        if (d->state == UPDATED)
+        {
+            if (d != ((data_t *)(item_userptr(current_item(screen->menu)))))
+            {
+                mvwprintw(screen->content, item_index(d->item), 3, UPDATED_CHAR);
+            }
+            else {
+                d->state = UNCHANGED;
+            }
         }
     }
 
-    update_panels_safe();
+    if (c > 0)
+    {
+        update_panels_safe();
+    }
 }
 
 static void *thread_read_files(void *args)
@@ -319,24 +339,7 @@ static void *thread_read_files(void *args)
         read_files (getMaxBytes(screen->details, &maxx, &maxy), opened_files, data);
 
         if (show_details == NULL) {
-            for (d=screen->datas; d; d=d->next)
-            {
-                if (d->state == UPDATED) {
-                    d->item->description.str = d->line;
-                }
-            }
-            /* Refresh menu, this has to be after writting the line and
-             * before pritting the '*' because unpost/post erase the line */
-            refresh_menus(screen);
-            for (d=screen->datas; d; d=d->next)
-            {
-                if (d->state == UPDATED && d != ((data_t *)(item_userptr(current_item(screen->menu))))) {
-                    mvwprintw(screen->content, item_index(d->item), 3, UPDATED_CHAR);
-                }
-                else {
-                    d->state = UNCHANGED;
-                }
-            }
+            menu_driver_update(screen, -1);
             hide_panel(screen->details_panel);
         }
         else {
@@ -771,12 +774,12 @@ static void process(screen_t *screen)
         {
             case KEY_UP:
             case 'k':
-              menu_driver_update(screen, d, REQ_UP_ITEM);
+              menu_driver_update(screen, REQ_UP_ITEM);
               break;
 
             case KEY_DOWN:
             case 'j':
-              menu_driver_update(screen, d, REQ_DOWN_ITEM);
+              menu_driver_update(screen, REQ_DOWN_ITEM);
               break;
 
             case KEY_ENTER:
