@@ -257,31 +257,43 @@ static void *thread_read_files(void *args)
     char c;
     int i, opened_files, maxx, maxy;
 #ifdef HAVE_KQUEUE
-		int kq;
+    int kq;
     struct kevent *ev;
+#elif defined(HAVE_EPOLL_CREATE)
+    int epollfd;
+    struct epoll_event *ev;
 #endif /* !HAVE_KQUEUE */
     screen_t *screen;
-    struct stat stats;
+//    struct stat stats;
     data_t *data, *d;//, *show_details = NULL;
 
-    data = ((thread_param_t *)args)->data;
     opened_files = ((thread_param_t *)args)->opened_files;
     screen = ((thread_param_t *)args)->master_screen;
+    data = screen->datas;
 
     free(args);
 
 #ifdef HAVE_KQUEUE
     kq = kqueue();
-    if (kq < 0) {
+    if (kq < 0)
+        {
         ER("Can't initialize kqueue");
+    }
+#elif defined(HAVE_EPOLL_CREATE)
+    epollfd = epoll_create1(0);
+    if (epoll_create1 < 0)
+    {
+       ER("Can't initialize epoll: %s", strerror(errno));
     }
 #endif /* !HAVE_KQUEUE */
 
 #ifdef HAVE_KQUEUE
     ev = (struct kevent *) malloc(sizeof(struct kevent) * opened_files + 3); /* allocate three extra events to get the notifications from the event loop */
-    if (ev == NULL) {
+    if (ev == NULL)
+    {
         ER("Can't allocate memory for kevents");
     }
+#elif defined(HAVE_EPOLL_CREATE)
 #endif /* !HAVE_KQUEUE */
 
 #ifdef HAVE_KQUEUE
