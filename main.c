@@ -414,20 +414,20 @@ static void *thread_read_files(void *args)
             DBG("Error retrieving kevent, we might have been interrupted");
         }
 #else  /* !HAVE_KQUEUE */
-				/* If the files have been updated, grab the last line from the file */
-				for (d=data; d; d=d->next)
-				{
-					if (stat(d->full_path, &stats) == -1)
-						ER("Could not obtain file stats for: '%s'", d->base_name);
+                /* If the files have been updated, grab the last line from the file */
+                for (d=data; d; d=d->next)
+                {
+                    if (stat(d->full_path, &stats) == -1)
+                        ER("Could not obtain file stats for: '%s'", d->base_name);
 
-					/* If the file has been modified since last check, update */
-					if (stats.st_mtime != d->last_mod)
-					{
-						d->last_mod = stats.st_mtime;
-						d->state = UPDATED;
-					}
-				}
-				usleep(25000);
+                    /* If the file has been modified since last check, update */
+                    if (stats.st_mtime != d->last_mod)
+                    {
+                        d->last_mod = stats.st_mtime;
+                        d->state = UPDATED;
+                    }
+                }
+                usleep(25000);
 #endif /* !HAVE_KQUEUE */
     }
 
@@ -786,26 +786,26 @@ static void process(screen_t *screen)
             case '\n':
             case 'l':
 #ifdef HAVE_KQUEUE
-								/* We send a signal to ourself to wakeup the kevent routine */
-                kill(getpid(), SIGUSR1);
+              /* We send a signal to ourself to wakeup the kevent routine */
+              kill(getpid(), SIGUSR1);
 #else /* !HAVE_KQUEUE */
-                show_details = item_userptr(current_item(screen->menu));
+              show_details = item_userptr(current_item(screen->menu));
 #endif /* HAVE_KQUEUE */
 
-                break;
+              break;
 
             /*  If no key was registered, or on some wacky
              * input we don't care about don't modify the screen state.
              */
             case ERR:
-                break;
+              break;
 
             /* Someother key was pressed, exit details window */
             default:
 #ifdef HAVE_KQUEUE
-                kill(getpid(), SIGUSR2);
+              kill(getpid(), SIGUSR2);
 #else /* !HAVE_KQUEUE */
-                show_details = NULL;
+              show_details = NULL;
 #endif
         }
     }
