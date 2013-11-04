@@ -132,7 +132,6 @@ typedef struct _screen_t
 typedef struct _thread_param_t
 {
     int opened_files;
-    data_t *data;
     screen_t *master_screen;
 } thread_param_t;
 
@@ -498,7 +497,7 @@ static void screen_destroy(screen_t *screen)
 }
 
 /* wrapper function for thread creation */
-static pthread_t *threads_init(data_t *data, int opened_files, screen_t *screen) {
+static pthread_t *threads_init(int opened_files, screen_t *screen) {
     thread_param_t *params;
     pthread_t *thread;
 
@@ -523,7 +522,6 @@ static pthread_t *threads_init(data_t *data, int opened_files, screen_t *screen)
         ER("Can't allocate memory for thread params");
     }
     params->opened_files = opened_files;
-    params->data = data;
     params->master_screen = screen;
 
     pthread_create(thread, NULL, thread_read_files, (void *)params);
@@ -752,7 +750,6 @@ static void screen_update(screen_t *screen, const data_t *show_details)
 static void process(screen_t *screen)
 {
     int c;
-    data_t *d;
 
     /* Force initial drawing */
     show_details = NULL;
@@ -853,14 +850,14 @@ int main(int argc, char **argv)
     columns = COLS;
 
     /* Create reading threads */
-    thread = threads_init(datas, opened_files, screen);
+    thread = threads_init(opened_files, screen);
 
     /* Do the work */
     process(screen);
 
     /* Cleanup */
     threads_destroy(thread);
-    data_destroy(datas);
+    data_destroy(screen->datas);
     screen_destroy(screen);
 
     return 0;
