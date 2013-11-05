@@ -35,6 +35,7 @@
 #include <errno.h>
 #include <menu.h>
 #include <panel.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -80,6 +81,8 @@
 #define INNER_WIN_LINES (LINES-3)
 #define INNER_WIN_COLS (COLS-2)
 
+#define SHOW_DETAILS 0x1
+#define HIDE_DETAILS 0x2
 
 #define TITLE "}-= TreeTop =-{"
 
@@ -98,6 +101,13 @@ static pthread_mutex_t mtx_post_menu;
 
 /* Mutex to protect doupdate calls */
 static pthread_mutex_t mtx_update_panels;
+
+/* Pipe to send "commands" from the getch loop to the reading thread */
+static int fildes[2];
+
+/* I always forget these */
+#define PIPE_READ  0
+#define PIPE_WRITE 1
 
 /* File information */
 typedef struct _data_t
@@ -274,8 +284,9 @@ static void menu_driver_update(screen_t *screen, int c)
 
 static void *thread_read_files(void *args)
 {
-    char c;
+    char c, cmd;
     int i, opened_files, maxx, maxy;
+    ssize_t r;
 #ifdef HAVE_KQUEUE
     int kq;
     struct kevent *ev;
@@ -325,8 +336,7 @@ static void *thread_read_files(void *args)
         i++;
     }
     EV_SET(&ev[i++], SIGWINCH, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, 0);
-    EV_SET(&ev[i++], SIGUSR1, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, 0);
-    EV_SET(&ev[i++], SIGUSR2, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, 0);
+    EV_SET(&ev[i++], fildes[PIPE_READ], EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, 0);
 #endif /* !HAVE_KQUEUE */
 
 #ifdef HAVE_KQUEUE
@@ -402,10 +412,39 @@ static void *thread_read_files(void *args)
                 show_details = NULL;
             }
             else if (ev->filter == EVFILT_READ) {
-                for (d=screen->datas; d; d=d->next) {
-                    if(d->fd == ev->ident) {
-                        d->state = UPDATED;
-                        break;
+                if (fildes[PIPE_READ] == ev->ident)
+                {
+                    if ((r = read(fildes[PIPE_READ], &cmd, sizeof(cmd))) == -1)
+                    {
+                        WR("reading command from pipe returned an error: %s", strerror(errno));
+                    }
+                    else if (r == 0)
+                    {
+                        WR("end-of-file detected from the command pipe, this is abnormal !");
+                    }
+                    else
+                    {
+                        switch(cmd)
+                        {
+                            case SHOW_DETAILS:
+                                show_details = item_userptr(current_item(screen->menu));
+                                break;
+                            case HIDE_DETAILS:
+                                show_details = NULL;
+                                break;
+                            default:
+                                /* Dunno what to do here ? */
+                                break;
+                        }
+                    }
+                }
+                else
+                {
+                    for (d=screen->datas; d; d=d->next) {
+                        if(d->fd == ev->ident) {
+                            d->state = UPDATED;
+                            break;
+                        }
                     }
                 }
             }
@@ -764,12 +803,14 @@ static void screen_update(screen_t *screen, const data_t *show_details)
 /* Capture user input (keys) and timeout to periodically referesh */
 static void process(screen_t *screen)
 {
+    char cmd;
     int c;
 
     /* Force initial drawing */
     show_details = NULL;
     while ((c = getch()) != 'Q' && c != 'q')
     {
+        cmd = 0;
         switch (c)
         {
             case KEY_UP:
@@ -786,8 +827,7 @@ static void process(screen_t *screen)
             case '\n':
             case 'l':
 #ifdef HAVE_KQUEUE
-              /* We send a signal to ourself to wakeup the kevent routine */
-              kill(getpid(), SIGUSR1);
+              cmd = SHOW_DETAILS;
 #else /* !HAVE_KQUEUE */
               show_details = item_userptr(current_item(screen->menu));
 #endif /* HAVE_KQUEUE */
@@ -803,10 +843,15 @@ static void process(screen_t *screen)
             /* Someother key was pressed, exit details window */
             default:
 #ifdef HAVE_KQUEUE
-              kill(getpid(), SIGUSR2);
+              cmd = HIDE_DETAILS;
 #else /* !HAVE_KQUEUE */
               show_details = NULL;
 #endif
+        }
+        if (cmd != 0)
+        {
+            /* wakes up the kevent/epoll routine */
+            write(fildes[PIPE_WRITE], &cmd, sizeof(cmd));
         }
     }
 }
@@ -849,6 +894,11 @@ int main(int argc, char **argv)
 
     DBG("Using config:  %s", fname);
     DBG("Using timeout: %d seconds", timeout_secs);
+
+    /* Initializing pipe */
+    if (pipe(fildes) == -1) {
+        ER("Can't create pipe: %s", strerror(errno));
+    }
 
     /* Disabling SIGUSR1 */
     action.sa_handler = SIG_IGN;
