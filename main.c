@@ -42,6 +42,8 @@
 #include <sys/ioctl.h>
 #ifdef HAVE_SYS_EVENT_H
 #include <sys/event.h>
+#elif defined(HAVE_EPOLL_CREATE)
+#include <sys/epoll.h>
 #endif /* !HAVE_SYS_EVENT_H */
 
 
@@ -285,17 +287,19 @@ static void menu_driver_update(screen_t *screen, int c)
 static void *thread_read_files(void *args)
 {
     char c, cmd;
-    int i, opened_files, maxx, maxy;
+    int i, nfds, opened_files, maxx, maxy;
     ssize_t r;
 #ifdef HAVE_KQUEUE
     int kq;
     struct kevent *ev;
 #elif defined(HAVE_EPOLL_CREATE)
     int epollfd;
-    struct epoll_event *ev;
+    struct epoll_event *ev, event;
 #endif /* !HAVE_KQUEUE */
+#ifndef HAVE_KQUEUE
+    struct stat stats;
+#endif
     screen_t *screen;
-//    struct stat stats;
     data_t *data, *d;//, *show_details = NULL;
 
     opened_files = ((thread_param_t *)args)->opened_files;
@@ -316,17 +320,25 @@ static void *thread_read_files(void *args)
     {
        ER("Can't initialize epoll: %s", strerror(errno));
     }
+		event.events = EPOLLIN;
 #endif /* !HAVE_KQUEUE */
 
 #ifdef HAVE_KQUEUE
-    ev = (struct kevent *) malloc(sizeof(struct kevent) * opened_files + 3); /* allocate three extra events to get the notifications from the event loop */
+    ev = (struct kevent *) malloc(sizeof(struct kevent) * opened_files + 2);
     if (ev == NULL)
     {
         ER("Can't allocate memory for kevents");
     }
 #elif defined(HAVE_EPOLL_CREATE)
+    //ev = (struct epoll_event *) malloc(sizeof(struct epoll_event) * opened_files + 1); /* allocate two extra events to get the notifications from the event loop */
+			ev = (struct epoll_event *) malloc(sizeof(struct epoll_event) * 1); /* allocate two extra events to get the notifications from the event loop */
+    if (ev == NULL)
+    {
+        ER("Can't allocate memory for epoll_events");
+    }
 #endif /* !HAVE_KQUEUE */
 
+#if defined(HAVE_KQUEUE) || defined(HAVE_EPOLL_CREATE)
 #ifdef HAVE_KQUEUE
     i = 0;
     for (d=screen->datas; d; d=d->next)
@@ -337,13 +349,16 @@ static void *thread_read_files(void *args)
     }
     EV_SET(&ev[i++], SIGWINCH, EVFILT_SIGNAL, EV_ADD | EV_ENABLE, 0, 0, 0);
     EV_SET(&ev[i++], fildes[PIPE_READ], EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, 0);
-#endif /* !HAVE_KQUEUE */
-
-#ifdef HAVE_KQUEUE
-    if (kevent(kq, ev, opened_files + 3, NULL, 0, NULL) < 0) {
+    if (kevent(kq, ev, opened_files + 2, NULL, 0, NULL) < 0) {
         ER("Can't set kevent");
     }
-#endif /* !HAVE_KQUEUE */
+#elif defined(HAVE_EPOLL_CREATE)
+		event.data.fd = fildes[PIPE_READ];
+		if (epoll_ctl(epollfd, EPOLL_CTL_ADD, fildes[PIPE_READ], &event) == -1) {
+			ER("Can't add file descriptor in epoll instance: %s", strerror(errno));
+		}
+#endif
+#endif /* defined(HAVE_KQUEUE) || defined(HAVE_EPOLL_CREATE) */
 
     for (;;) {
         read_files (getMaxBytes(screen->details, &maxx, &maxy), opened_files, data);
@@ -376,11 +391,25 @@ static void *thread_read_files(void *args)
 
         update_panels_safe();
 
+#if defined(HAVE_KQUEUE) || defined(HAVE_EPOLL_CREATE)
 #ifdef HAVE_KQUEUE
-        i = kevent(kq, NULL, 0, ev, 1, NULL);
-        if (i > 0) {
-            if (ev->filter == EVFILT_SIGNAL &&
-                ev->ident == SIGWINCH) {
+        nfds = kevent(kq, NULL, 0, ev, 1, NULL);
+#elif defined(HAVE_EPOLL_CREATE)
+				nfds = epoll_wait(epollfd, ev, 1, 0);
+#endif
+        if (nfds < 0)
+				{
+#ifdef HAVE_KQUEUE
+            DBG("Error retrieving kevent, we might have been interrupted");
+#elif defined(HAVE_EPOLL_CREATE)
+            DBG("Error retrieving epoll events, we might have been interrupted");
+#endif
+        }
+				for (i = 0; i < nfds; i++)
+				{
+#ifdef HAVE_KQUEUE
+            if (ev[i].filter == EVFILT_SIGNAL &&
+                ev[i].ident == SIGWINCH) {
 
                 /* This ensure that LINES and COLS are correctly updated */
                 doupdate();
@@ -401,18 +430,21 @@ static void *thread_read_files(void *args)
                 refresh_menus(screen);
                 update_panels_safe();
             }
-            else if (ev->filter == EVFILT_SIGNAL &&
-                     ev->ident == SIGUSR1) {
+            else if (ev[i].filter == EVFILT_SIGNAL &&
+                     ev[i].ident == SIGUSR1) {
                /* handle displaying details here */
                 show_details = item_userptr(current_item(screen->menu));
             }
-            else if (ev->filter == EVFILT_SIGNAL &&
-                     ev->ident == SIGUSR2) {
+            else if (ev[i].filter == EVFILT_SIGNAL &&
+                     ev[i].ident == SIGUSR2) {
                /* handle displaying details here */
                 show_details = NULL;
             }
-            else if (ev->filter == EVFILT_READ) {
-                if (fildes[PIPE_READ] == ev->ident)
+            else if (ev[i].filter == EVFILT_READ) {
+                if (fildes[PIPE_READ] == ev[i].ident)
+#elif defined(HAVE_EPOLL_CREATE)
+								if (fildes[PIPE_READ] == ev[i].data.fd)
+#endif
                 {
                     if ((r = read(fildes[PIPE_READ], &cmd, sizeof(cmd))) == -1)
                     {
@@ -438,21 +470,20 @@ static void *thread_read_files(void *args)
                         }
                     }
                 }
+#ifdef HAVE_KQUEUE
                 else
-                {
-                    for (d=screen->datas; d; d=d->next) {
-                        if(d->fd == ev->ident) {
-                            d->state = UPDATED;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if (i < 0) {
-            DBG("Error retrieving kevent, we might have been interrupted");
-        }
-#else  /* !HAVE_KQUEUE */
+								{
+									for (d=screen->datas; d; d=d->next) {
+										if(d->fd == ev[i].ident) {
+												d->state = UPDATED;
+												break;
+											}
+									}
+								}
+#endif
+				}
+#endif
+#ifndef HAVE_KQUEUE
                 /* If the files have been updated, grab the last line from the file */
                 for (d=data; d; d=d->next)
                 {
@@ -469,6 +500,12 @@ static void *thread_read_files(void *args)
                 usleep(25000);
 #endif /* !HAVE_KQUEUE */
     }
+
+#ifdef HAVE_KQUEUE
+		free(ev);
+#elif defined(HAVE_EPOLL_CREATE)
+		free(ev);
+#endif
 
     return (void *) NULL;
 }
@@ -826,7 +863,7 @@ static void process(screen_t *screen)
             case KEY_ENTER:
             case '\n':
             case 'l':
-#ifdef HAVE_KQUEUE
+#if defined(HAVE_KQUEUE) || defined(HAVE_EPOLL_CREATE)
               cmd = SHOW_DETAILS;
 #else /* !HAVE_KQUEUE */
               show_details = item_userptr(current_item(screen->menu));
@@ -842,7 +879,7 @@ static void process(screen_t *screen)
 
             /* Someother key was pressed, exit details window */
             default:
-#ifdef HAVE_KQUEUE
+#if defined(HAVE_KQUEUE) || defined(HAVE_EPOLL_CREATE)
               cmd = HIDE_DETAILS;
 #else /* !HAVE_KQUEUE */
               show_details = NULL;
