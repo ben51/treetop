@@ -471,6 +471,7 @@ static void *thread_read_files(void *args)
                     }
                 }
 #ifdef HAVE_KQUEUE
+						}
                 else
 								{
 									for (d=screen->datas; d; d=d->next) {
